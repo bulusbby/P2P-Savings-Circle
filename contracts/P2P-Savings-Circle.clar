@@ -10,6 +10,8 @@
 (define-constant err-invalid-recipient (err u108))
 (define-constant err-cycle-not-complete (err u109))
 (define-constant err-insufficient-funds (err u110))
+(define-constant err-emergency-not-triggered (err u111))
+(define-constant err-already-withdrawn (err u112))
 
 (define-data-var next-circle-id uint u1)
 
@@ -24,7 +26,9 @@
     created-at: uint,
     is-active: bool,
     current-cycle: uint,
-    current-recipient-index: uint
+    current-recipient-index: uint,
+    emergency-triggered: bool,
+    emergency-trigger-height: uint
   }
 )
 
@@ -35,7 +39,8 @@
     member-index: uint,
     total-contributions: uint,
     last-contribution-cycle: uint,
-    has-received-payout: bool
+    has-received-payout: bool,
+    emergency-withdrawn: bool
   }
 )
 
@@ -83,7 +88,9 @@
         created-at: stacks-block-height,
         is-active: true,
         current-cycle: u1,
-        current-recipient-index: u0
+        current-recipient-index: u0,
+        emergency-triggered: false,
+        emergency-trigger-height: u0
       }
     )
     
@@ -121,7 +128,8 @@
         member-index: member-count,
         total-contributions: u0,
         last-contribution-cycle: u0,
-        has-received-payout: false
+        has-received-payout: false,
+        emergency-withdrawn: false
       }
     )
     
@@ -300,5 +308,115 @@
       (recipient-index (get current-recipient-index circle))
     )
     (ok (map-get? circle-member-list { circle-id: circle-id, index: recipient-index }))
+  )
+)
+
+(define-public (trigger-emergency-exit (circle-id uint))
+  (let
+    (
+      (circle (unwrap! (map-get? circles { circle-id: circle-id }) err-not-found))
+      (stats (unwrap! (map-get? circle-stats { circle-id: circle-id }) err-not-found))
+    )
+    (asserts! (is-eq tx-sender (get creator circle)) err-owner-only)
+    (asserts! (get is-active circle) err-circle-not-active)
+    (asserts! (not (get emergency-triggered circle)) err-already-exists)
+    
+    (map-set circles
+      { circle-id: circle-id }
+      (merge circle 
+        {
+          emergency-triggered: true,
+          emergency-trigger-height: stacks-block-height,
+          is-active: false
+        }
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (emergency-withdraw (circle-id uint))
+  (let
+    (
+      (circle (unwrap! (map-get? circles { circle-id: circle-id }) err-not-found))
+      (member-data (unwrap! (map-get? circle-members { circle-id: circle-id, member: tx-sender }) err-not-member))
+      (stats (unwrap! (map-get? circle-stats { circle-id: circle-id }) err-not-found))
+      (total-contributions (get total-contributions member-data))
+      (emergency-wait-blocks u144)
+      (current-height stacks-block-height)
+      (trigger-height (get emergency-trigger-height circle))
+    )
+    (asserts! (get emergency-triggered circle) err-emergency-not-triggered)
+    (asserts! (not (get emergency-withdrawn member-data)) err-already-withdrawn)
+    (asserts! (> total-contributions u0) err-invalid-amount)
+    (asserts! (>= (- current-height trigger-height) emergency-wait-blocks) err-emergency-not-triggered)
+    
+    (let
+      (
+        (total-pool (get total-contributions stats))
+        (current-pot (get current-pot stats))
+        (member-share (if (> total-pool u0) 
+                       (/ (* total-contributions current-pot) total-pool)
+                       u0))
+      )
+      (asserts! (> member-share u0) err-insufficient-funds)
+      
+      (try! (as-contract (stx-transfer? member-share tx-sender tx-sender)))
+      
+      (map-set circle-members
+        { circle-id: circle-id, member: tx-sender }
+        (merge member-data { emergency-withdrawn: true })
+      )
+      
+      (map-set circle-stats
+        { circle-id: circle-id }
+        (merge stats { current-pot: (- current-pot member-share) })
+      )
+      
+      (ok member-share)
+    )
+  )
+)
+
+(define-read-only (get-emergency-withdrawal-amount (circle-id uint) (member principal))
+  (let
+    (
+      (circle (unwrap! (map-get? circles { circle-id: circle-id }) (ok u0)))
+      (member-data (unwrap! (map-get? circle-members { circle-id: circle-id, member: member }) (ok u0)))
+      (stats (unwrap! (map-get? circle-stats { circle-id: circle-id }) (ok u0)))
+      (total-contributions (get total-contributions member-data))
+    )
+    (if (get emergency-triggered circle)
+      (let
+        (
+          (total-pool (get total-contributions stats))
+          (current-pot (get current-pot stats))
+        )
+        (if (and (> total-pool u0) (> total-contributions u0))
+          (ok (/ (* total-contributions current-pot) total-pool))
+          (ok u0)
+        )
+      )
+      (ok u0)
+    )
+  )
+)
+
+(define-read-only (can-emergency-withdraw (circle-id uint) (member principal))
+  (let
+    (
+      (circle (unwrap! (map-get? circles { circle-id: circle-id }) (ok false)))
+      (member-data (unwrap! (map-get? circle-members { circle-id: circle-id, member: member }) (ok false)))
+      (emergency-wait-blocks u144)
+      (current-height stacks-block-height)
+      (trigger-height (get emergency-trigger-height circle))
+    )
+    (ok (and
+      (get emergency-triggered circle)
+      (not (get emergency-withdrawn member-data))
+      (> (get total-contributions member-data) u0)
+      (>= (- current-height trigger-height) emergency-wait-blocks)
+    ))
   )
 )
