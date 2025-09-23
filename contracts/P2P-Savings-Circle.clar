@@ -12,8 +12,30 @@
 (define-constant err-insufficient-funds (err u110))
 (define-constant err-emergency-not-triggered (err u111))
 (define-constant err-already-withdrawn (err u112))
+(define-constant err-low-reputation (err u113))
+(define-constant err-reputation-exists (err u114))
+
+(define-constant base-reputation u100)
+(define-constant max-reputation u1000)
+(define-constant min-reputation u0)
+(define-constant on-time-bonus u10)
+(define-constant late-penalty u15)
+(define-constant completion-bonus u50)
+(define-constant high-reputation-threshold u500)
 
 (define-data-var next-circle-id uint u1)
+
+(define-map member-reputation
+  { member: principal }
+  {
+    reputation-score: uint,
+    circles-completed: uint,
+    circles-defaulted: uint,
+    total-contributions: uint,
+    on-time-contributions: uint,
+    last-updated: uint
+  }
+)
 
 (define-map circles
   { circle-id: uint }
@@ -110,6 +132,55 @@
   )
 )
 
+(define-public (create-priority-circle (name (string-ascii 50)) (contribution-amount uint) (max-members uint) (duration-blocks uint))
+  (let
+    (
+      (circle-id (var-get next-circle-id))
+      (is-high-rep (is-high-reputation-member tx-sender))
+    )
+    (asserts! (> contribution-amount u0) err-invalid-amount)
+    (asserts! (and (>= max-members u3) (<= max-members u20)) err-invalid-amount)
+    (asserts! (> duration-blocks u0) err-invalid-amount)
+    (asserts! is-high-rep err-low-reputation)
+    
+    (let
+      (
+        (discounted-amount (/ (* contribution-amount u90) u100))
+      )
+      (map-set circles
+        { circle-id: circle-id }
+        {
+          name: name,
+          contribution-amount: discounted-amount,
+          max-members: max-members,
+          duration-blocks: duration-blocks,
+          creator: tx-sender,
+          created-at: stacks-block-height,
+          is-active: true,
+          current-cycle: u1,
+          current-recipient-index: u0,
+          emergency-triggered: false,
+          emergency-trigger-height: u0
+        }
+      )
+      
+      (map-set circle-stats
+        { circle-id: circle-id }
+        {
+          total-members: u0,
+          total-contributions: u0,
+          total-payouts: u0,
+          current-pot: u0,
+          current-cycle-contributions: u0
+        }
+      )
+      
+      (var-set next-circle-id (+ circle-id u1))
+      (ok circle-id)
+    )
+  )
+)
+
 (define-public (join-circle (circle-id uint))
   (let
     (
@@ -120,6 +191,11 @@
     (asserts! (get is-active circle) err-circle-not-active)
     (asserts! (< member-count (get max-members circle)) err-circle-full)
     (asserts! (is-none (map-get? circle-members { circle-id: circle-id, member: tx-sender })) err-already-exists)
+    
+    (match (map-get? member-reputation { member: tx-sender })
+      some-rep true
+      (try! (initialize-reputation tx-sender))
+    )
     
     (map-set circle-members
       { circle-id: circle-id, member: tx-sender }
@@ -159,34 +235,47 @@
     (asserts! (get is-active circle) err-circle-not-active)
     (asserts! (is-none (map-get? cycle-contributions { circle-id: circle-id, cycle: current-cycle, member: tx-sender })) err-already-paid)
     
-    (try! (stx-transfer? contribution-amount tx-sender (as-contract tx-sender)))
-    
-    (map-set cycle-contributions
-      { circle-id: circle-id, cycle: current-cycle, member: tx-sender }
-      {
-        amount: contribution-amount,
-        contributed-at: stacks-block-height
-      }
-    )
-    
-    (map-set circle-members
-      { circle-id: circle-id, member: tx-sender }
-      (merge member-data 
+    (let
+      (
+        (actual-amount (unwrap! (get-contribution-amount-with-reputation circle-id tx-sender) err-invalid-amount))
+        (circle-start-height (get created-at circle))
+        (cycle-expected-height (+ circle-start-height (* (- current-cycle u1) (get duration-blocks circle))))
+        (is-on-time (<= stacks-block-height (+ cycle-expected-height u144)))
+      )
+      (try! (stx-transfer? actual-amount tx-sender (as-contract tx-sender)))
+      
+      (unwrap! (update-reputation-score tx-sender 
+                                       (if is-on-time (to-int on-time-bonus) (- (to-int late-penalty))) 
+                                       u1 
+                                       is-on-time) err-invalid-amount)
+      
+      (map-set cycle-contributions
+        { circle-id: circle-id, cycle: current-cycle, member: tx-sender }
         {
-          total-contributions: (+ (get total-contributions member-data) contribution-amount),
-          last-contribution-cycle: current-cycle
+          amount: actual-amount,
+          contributed-at: stacks-block-height
         }
       )
-    )
-    
-    (map-set circle-stats
-      { circle-id: circle-id }
-      (merge stats 
-        {
-          total-contributions: (+ (get total-contributions stats) contribution-amount),
-          current-pot: (+ (get current-pot stats) contribution-amount),
-          current-cycle-contributions: (+ (get current-cycle-contributions stats) u1)
-        }
+      
+      (map-set circle-members
+        { circle-id: circle-id, member: tx-sender }
+        (merge member-data 
+          {
+            total-contributions: (+ (get total-contributions member-data) actual-amount),
+            last-contribution-cycle: current-cycle
+          }
+        )
+      )
+      
+      (map-set circle-stats
+        { circle-id: circle-id }
+        (merge stats 
+          {
+            total-contributions: (+ (get total-contributions stats) actual-amount),
+            current-pot: (+ (get current-pot stats) actual-amount),
+            current-cycle-contributions: (+ (get current-cycle-contributions stats) u1)
+          }
+        )
       )
     )
     
@@ -308,6 +397,134 @@
       (recipient-index (get current-recipient-index circle))
     )
     (ok (map-get? circle-member-list { circle-id: circle-id, index: recipient-index }))
+  )
+)
+
+(define-public (initialize-reputation (member principal))
+  (let
+    (
+      (existing-rep (map-get? member-reputation { member: member }))
+    )
+    (asserts! (is-none existing-rep) err-reputation-exists)
+    
+    (map-set member-reputation
+      { member: member }
+      {
+        reputation-score: base-reputation,
+        circles-completed: u0,
+        circles-defaulted: u0,
+        total-contributions: u0,
+        on-time-contributions: u0,
+        last-updated: stacks-block-height
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-private (update-reputation-score (member principal) (score-change int) (contribution-update uint) (on-time bool))
+  (let
+    (
+      (current-rep (default-to 
+        {
+          reputation-score: base-reputation,
+          circles-completed: u0,
+          circles-defaulted: u0,
+          total-contributions: u0,
+          on-time-contributions: u0,
+          last-updated: stacks-block-height
+        }
+        (map-get? member-reputation { member: member })
+      ))
+      (current-score (get reputation-score current-rep))
+      (new-score-raw (if (>= score-change 0)
+                       (+ current-score (to-uint score-change))
+                       (if (>= current-score (to-uint (- score-change)))
+                         (- current-score (to-uint (- score-change)))
+                         min-reputation)))
+      (new-score (if (> new-score-raw max-reputation) max-reputation new-score-raw))
+    )
+    (map-set member-reputation
+      { member: member }
+      (merge current-rep 
+        {
+          reputation-score: new-score,
+          total-contributions: (+ (get total-contributions current-rep) contribution-update),
+          on-time-contributions: (if on-time 
+                                   (+ (get on-time-contributions current-rep) u1)
+                                   (get on-time-contributions current-rep)),
+          last-updated: stacks-block-height
+        }
+      )
+    )
+    (ok new-score)
+  )
+)
+
+(define-private (mark-circle-completion (member principal) (completed bool))
+  (let
+    (
+      (current-rep (default-to 
+        {
+          reputation-score: base-reputation,
+          circles-completed: u0,
+          circles-defaulted: u0,
+          total-contributions: u0,
+          on-time-contributions: u0,
+          last-updated: stacks-block-height
+        }
+        (map-get? member-reputation { member: member })
+      ))
+    )
+    (map-set member-reputation
+      { member: member }
+      (merge current-rep 
+        {
+          circles-completed: (if completed 
+                               (+ (get circles-completed current-rep) u1)
+                               (get circles-completed current-rep)),
+          circles-defaulted: (if (not completed) 
+                               (+ (get circles-defaulted current-rep) u1)
+                               (get circles-defaulted current-rep)),
+          last-updated: stacks-block-height
+        }
+      )
+    )
+    (if completed
+      (update-reputation-score member (to-int completion-bonus) u0 false)
+      (update-reputation-score member (- (to-int late-penalty)) u0 false)
+    )
+  )
+)
+
+(define-read-only (get-member-reputation (member principal))
+  (map-get? member-reputation { member: member })
+)
+
+(define-read-only (is-high-reputation-member (member principal))
+  (let
+    (
+      (rep-data (map-get? member-reputation { member: member }))
+    )
+    (match rep-data
+      some-rep (>= (get reputation-score some-rep) high-reputation-threshold)
+      false
+    )
+  )
+)
+
+(define-read-only (get-contribution-amount-with-reputation (circle-id uint) (member principal))
+  (let
+    (
+      (circle (unwrap! (map-get? circles { circle-id: circle-id }) (ok u0)))
+      (base-amount (get contribution-amount circle))
+      (is-high-rep (is-high-reputation-member member))
+    )
+    (if is-high-rep
+      (ok (/ (* base-amount u95) u100))
+      (ok base-amount)
+    )
   )
 )
 
