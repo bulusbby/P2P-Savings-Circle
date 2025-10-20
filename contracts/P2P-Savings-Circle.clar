@@ -22,6 +22,7 @@
 (define-constant late-penalty u15)
 (define-constant completion-bonus u50)
 (define-constant high-reputation-threshold u500)
+(define-constant payout-grace-blocks u144)
 
 (define-data-var next-circle-id uint u1)
 
@@ -88,6 +89,11 @@
     amount: uint,
     contributed-at: uint
   }
+)
+
+(define-map cycle-penalties
+  { circle-id: uint, cycle: uint, member: principal }
+  { penalized: bool }
 )
 
 (define-public (create-circle (name (string-ascii 50)) (contribution-amount uint) (max-members uint) (duration-blocks uint))
@@ -340,6 +346,94 @@
     )
     
     (ok recipient)
+  )
+)
+
+(define-public (force-distribute-after-deadline (circle-id uint))
+  (let
+    (
+      (circle (unwrap! (map-get? circles { circle-id: circle-id }) err-not-found))
+      (stats (unwrap! (map-get? circle-stats { circle-id: circle-id }) err-not-found))
+      (recipient-index (get current-recipient-index circle))
+      (recipient-data (unwrap! (map-get? circle-member-list { circle-id: circle-id, index: recipient-index }) err-not-found))
+      (recipient (get member recipient-data))
+      (payout-amount (get current-pot stats))
+      (current-cycle (get current-cycle circle))
+      (total-members (get total-members stats))
+      (start-height (get created-at circle))
+      (duration (get duration-blocks circle))
+      (cycle-deadline (+ start-height (* current-cycle duration)))
+      (is-past-deadline (>= stacks-block-height (+ cycle-deadline payout-grace-blocks)))
+    )
+    (asserts! (get is-active circle) err-circle-not-active)
+    (asserts! is-past-deadline err-cycle-not-complete)
+    (asserts! (> payout-amount u0) err-insufficient-funds)
+    
+    (try! (as-contract (stx-transfer? payout-amount tx-sender recipient)))
+    
+    (let
+      (
+        (recipient-member-data (unwrap! (map-get? circle-members { circle-id: circle-id, member: recipient }) err-not-member))
+      )
+      (map-set circle-members
+        { circle-id: circle-id, member: recipient }
+        (merge recipient-member-data { has-received-payout: true })
+      )
+    )
+    
+    (map-set circle-stats
+      { circle-id: circle-id }
+      (merge stats 
+        {
+          total-payouts: (+ (get total-payouts stats) payout-amount),
+          current-pot: u0,
+          current-cycle-contributions: u0
+        }
+      )
+    )
+    
+    (let
+      (
+        (next-recipient-index (if (< (+ recipient-index u1) total-members) (+ recipient-index u1) u0))
+        (next-cycle (if (is-eq next-recipient-index u0) (+ current-cycle u1) current-cycle))
+      )
+      (map-set circles
+        { circle-id: circle-id }
+        (merge circle 
+          {
+            current-recipient-index: next-recipient-index,
+            current-cycle: next-cycle
+          }
+        )
+      )
+    )
+    
+    (ok recipient)
+  )
+)
+
+(define-public (penalize-missed-contribution (circle-id uint) (cycle uint) (member principal))
+  (let
+    (
+      (circle (unwrap! (map-get? circles { circle-id: circle-id }) err-not-found))
+      (start-height (get created-at circle))
+      (duration (get duration-blocks circle))
+      (current-cycle (get current-cycle circle))
+      (cycle-deadline (+ start-height (* cycle duration)))
+      (is-past-deadline (>= stacks-block-height (+ cycle-deadline payout-grace-blocks)))
+      (existing (map-get? cycle-penalties { circle-id: circle-id, cycle: cycle, member: member }))
+      (contribution (map-get? cycle-contributions { circle-id: circle-id, cycle: cycle, member: member }))
+    )
+    (asserts! is-past-deadline err-cycle-not-complete)
+    (asserts! (<= cycle current-cycle) err-cycle-not-complete)
+    (asserts! (is-none contribution) err-already-paid)
+    (asserts! (is-none existing) err-already-exists)
+    (unwrap! (update-reputation-score member (- (to-int late-penalty)) u0 false) err-invalid-amount)
+    (map-set cycle-penalties
+      { circle-id: circle-id, cycle: cycle, member: member }
+      { penalized: true }
+    )
+    (ok true)
   )
 )
 
